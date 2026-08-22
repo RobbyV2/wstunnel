@@ -40,6 +40,10 @@ jobs:
             target: arm-unknown-linux-musleabihf
             build-args: "--release --no-default-features --features ring"
 
+          - name: Linux riscv64
+            target: riscv64gc-unknown-linux-musl
+            build-args: "--release --no-default-features --features ring"
+
           - name: Freebsd x86_64
             target: x86_64-unknown-freebsd
             build-args: "--release --no-default-features --features ring --features=jemalloc"
