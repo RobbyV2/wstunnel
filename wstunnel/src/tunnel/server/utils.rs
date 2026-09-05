@@ -1,7 +1,7 @@
 use crate::LocalProtocol;
 use crate::restrictions::types::{
     AllowConfig, AllowReverseTunnelConfig, AllowTunnelConfig, MatchConfig, RestrictionConfig, RestrictionsRules,
-    ReverseTunnelConfigProtocol, TunnelConfigProtocol,
+    ReverseTunnelProtocol, TunnelProtocol,
 };
 use crate::tunnel::RemoteAddr;
 use crate::tunnel::transport::{JWT_HEADER_PREFIX, JwtTunnelConfig, jwt_token_to_tunnel, tunnel_to_jwt_token};
@@ -10,7 +10,7 @@ use bytes::Bytes;
 use derive_more::{Display, Error};
 use http_body_util::Either;
 use http_body_util::combinators::BoxBody;
-use hyper::body::{Body, Incoming};
+use hyper::body::Body;
 use hyper::header::{AUTHORIZATION, COOKIE, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
 use hyper::{Request, Response, StatusCode, http};
 use jsonwebtoken::TokenData;
@@ -52,12 +52,12 @@ pub(super) fn find_mapped_port(req_port: u16, restriction: &RestrictionConfig) -
 }
 
 #[inline]
-pub(super) fn extract_authorization(req: &Request<Incoming>) -> Option<&str> {
+pub(super) fn extract_authorization<B>(req: &Request<B>) -> Option<&str> {
     req.headers().get(AUTHORIZATION)?.to_str().ok()
 }
 
 #[inline]
-pub(super) fn extract_x_forwarded_for(req: &Request<Incoming>) -> Option<(IpAddr, &str)> {
+pub(super) fn extract_x_forwarded_for<B>(req: &Request<B>) -> Option<(IpAddr, &str)> {
     let x_forward_for = req.headers().get("X-Forwarded-For")?;
 
     // X-Forwarded-For: <client>, <proxy1>, <proxy2>
@@ -91,7 +91,7 @@ pub(super) enum PathPrefixErr {
 }
 
 #[inline]
-pub(super) fn extract_tunnel_info(req: &Request<Incoming>) -> anyhow::Result<TokenData<JwtTunnelConfig>> {
+pub(super) fn extract_tunnel_info<B>(req: &Request<B>) -> anyhow::Result<TokenData<JwtTunnelConfig>> {
     let jwt = req
         .headers()
         .get(SEC_WEBSOCKET_PROTOCOL)
@@ -140,11 +140,7 @@ impl AllowReverseTunnelConfig {
             return false;
         }
 
-        if !self.protocol.is_empty()
-            && !self
-                .protocol
-                .contains(&ReverseTunnelConfigProtocol::from(&remote.protocol))
-        {
+        if !self.protocol.is_empty() && !self.protocol.contains(&ReverseTunnelProtocol::from(&remote.protocol)) {
             return false;
         }
 
@@ -167,7 +163,7 @@ impl AllowTunnelConfig {
             return false;
         }
 
-        if !self.protocol.is_empty() && !self.protocol.contains(&TunnelConfigProtocol::from(&remote.protocol)) {
+        if !self.protocol.is_empty() && !self.protocol.contains(&TunnelProtocol::from(&remote.protocol)) {
             return false;
         }
 
@@ -211,6 +207,23 @@ pub(super) fn validate_tunnel<'a>(
         .find(|restriction| restriction.allow.iter().any(|allow| allow.is_allowed(remote)))
 }
 
+/// Whether any restriction could allow a tunnel for this path prefix and authorization.
+///
+/// This is the destination-independent half of [`validate_tunnel`]: it answers "may this client
+/// talk to us at all", without knowing where it wants to go. Webtransport checks it when accepting
+/// a session, since one session is shared by every tunnel the client opens on it and the
+/// destination only arrives per stream. Streams are still validated in full afterwards.
+pub(super) fn matches_any_restriction(
+    path_prefix: &str,
+    authorization: Option<&str>,
+    restrictions: &RestrictionsRules,
+) -> bool {
+    restrictions
+        .restrictions
+        .iter()
+        .any(|restriction| restriction.filter(path_prefix, authorization))
+}
+
 pub(super) fn inject_cookie(response: &mut http::Response<impl Body>, remote_addr: &RemoteAddr) -> Result<(), ()> {
     let Ok(header_val) = HeaderValue::from_str(&tunnel_to_jwt_token(Uuid::from_u128(0), remote_addr)) else {
         error!("Bad header value for reverse socks5: {} {}", remote_addr.host, remote_addr.port);
@@ -240,7 +253,7 @@ mod tests {
                     name: "restrict1".into(),
                     r#match: vec![MatchConfig::Any],
                     allow: vec![AllowConfig::Tunnel(AllowTunnelConfig {
-                        protocol: vec![TunnelConfigProtocol::Tcp],
+                        protocol: vec![TunnelProtocol::Tcp],
                         port: vec![80..=80],
                         cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 24).unwrap())],
                         host: Regex::new("example.com").unwrap(),
@@ -251,7 +264,7 @@ mod tests {
                     name: "restrict2".into(),
                     r#match: vec![MatchConfig::Any],
                     allow: vec![AllowConfig::ReverseTunnel(AllowReverseTunnelConfig {
-                        protocol: vec![ReverseTunnelConfigProtocol::Tcp],
+                        protocol: vec![ReverseTunnelProtocol::Tcp],
                         port: vec![80..=80],
                         cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 24).unwrap())],
                         port_mapping: Default::default(),
@@ -361,7 +374,7 @@ mod tests {
     #[test]
     fn test_reverse_tunnel_is_allowed() {
         let config = AllowReverseTunnelConfig {
-            protocol: vec![ReverseTunnelConfigProtocol::Tcp],
+            protocol: vec![ReverseTunnelProtocol::Tcp],
             port: vec![80..=80],
             cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 8).unwrap())],
             port_mapping: Default::default(),
@@ -389,7 +402,7 @@ mod tests {
     #[test]
     fn test_reverse_tunnel_is_not_allowed() {
         let config = AllowReverseTunnelConfig {
-            protocol: vec![ReverseTunnelConfigProtocol::Tcp],
+            protocol: vec![ReverseTunnelProtocol::Tcp],
             port: vec![80..=80],
             cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 24).unwrap())],
             port_mapping: Default::default(),
@@ -454,7 +467,7 @@ mod tests {
     #[test]
     fn test_reverse_unix_tunnel_is_allowed() {
         let config = AllowReverseTunnelConfig {
-            protocol: vec![ReverseTunnelConfigProtocol::Unix],
+            protocol: vec![ReverseTunnelProtocol::Unix],
             port: vec![],
             cidr: vec![],
             port_mapping: Default::default(),
@@ -493,7 +506,7 @@ mod tests {
     #[test]
     fn test_tunnel_is_allowed() {
         let config = AllowTunnelConfig {
-            protocol: vec![TunnelConfigProtocol::Tcp],
+            protocol: vec![TunnelProtocol::Tcp],
             port: vec![80..=80],
             cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 8).unwrap())],
             host: Regex::new(".*").unwrap(),
@@ -529,7 +542,7 @@ mod tests {
     #[test]
     fn test_tunnel_is_not_allowed() {
         let config = AllowTunnelConfig {
-            protocol: vec![TunnelConfigProtocol::Tcp],
+            protocol: vec![TunnelProtocol::Tcp],
             port: vec![80..=80],
             cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 24).unwrap())],
             host: Regex::new("example.com").unwrap(),

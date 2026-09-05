@@ -1,17 +1,25 @@
+use super::{DownstreamRead, DownstreamWrite};
 use crate::protocols::stdio;
 use crate::tunnel::{LocalProtocol, RemoteAddr};
 use anyhow::{Context, anyhow};
 use std::pin::Pin;
 use std::task::Poll;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
 use tokio_stream::Stream;
 use url::Host;
 
-pub struct StdioTunnelListener<R, W>
+// Stdio has no post-connect handshake: the concrete write half relies on the no-op default.
+// `run_server` yields these concrete types, so they can be named for a direct impl (a non-auto
+// trait like `TunnelConnectorWrite` does not leak through an `impl AsyncWrite` return type).
+#[cfg(unix)]
+impl DownstreamWrite for tokio_fd::AsyncFd {}
+#[cfg(not(unix))]
+impl DownstreamWrite for tokio::io::DuplexStream {}
+
+pub struct StdioDownstreamListener<R, W>
 where
-    R: AsyncRead + Send + 'static,
-    W: AsyncWrite + Send + 'static,
+    R: DownstreamRead,
+    W: DownstreamWrite,
 {
     listener: Option<(R, W)>,
     dest: (Host, u16),
@@ -22,14 +30,14 @@ pub async fn new_stdio_listener(
     dest: (Host, u16),
     proxy_protocol: bool,
 ) -> anyhow::Result<(
-    StdioTunnelListener<impl AsyncRead + Send, impl AsyncWrite + Send>,
+    StdioDownstreamListener<impl DownstreamRead, impl DownstreamWrite>,
     oneshot::Sender<()>,
 )> {
     let (listener, handle) = stdio::run_server()
         .await
         .with_context(|| anyhow!("Cannot start STDIO server"))?;
     Ok((
-        StdioTunnelListener {
+        StdioDownstreamListener {
             listener: Some(listener),
             proxy_protocol,
             dest,
@@ -38,10 +46,10 @@ pub async fn new_stdio_listener(
     ))
 }
 
-impl<R, W> Stream for StdioTunnelListener<R, W>
+impl<R, W> Stream for StdioDownstreamListener<R, W>
 where
-    R: AsyncRead + Send + 'static,
-    W: AsyncWrite + Send + 'static,
+    R: DownstreamRead,
+    W: DownstreamWrite,
 {
     type Item = anyhow::Result<((R, W), RemoteAddr)>;
 

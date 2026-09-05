@@ -243,16 +243,16 @@ pub async fn run_server(
     configure_listener: impl Fn(&UdpSocket) -> anyhow::Result<()>,
     mk_send_socket: impl Fn(&Arc<UdpSocket>) -> anyhow::Result<Arc<UdpSocket>>,
 ) -> Result<impl Stream<Item = io::Result<UdpStream>>, anyhow::Error> {
-    info!(
-        "Starting UDP server listening cnx on {} with cnx timeout of {}s",
-        bind,
-        timeout.unwrap_or(Duration::from_secs(0)).as_secs()
-    );
-
     let listener = UdpSocket::bind(bind)
         .await
         .with_context(|| format!("Cannot create UDP server {bind:?}"))?;
     configure_listener(&listener)?;
+
+    info!(
+        "Starting UDP server listening cnx on {} with cnx timeout of {}s",
+        listener.local_addr().unwrap_or(bind),
+        timeout.unwrap_or(Duration::from_secs(0)).as_secs()
+    );
 
     let udp_server = UdpServer::new(listener, timeout);
     let stream = stream::unfold(
@@ -302,17 +302,17 @@ pub async fn run_server(
 }
 
 #[derive(Clone)]
-pub struct WsUdpSocket {
+pub struct WsUdpStream {
     socket: Arc<UdpSocket>,
 }
 
-impl WsUdpSocket {
+impl WsUdpStream {
     pub fn new(socket: Arc<UdpSocket>) -> Self {
         Self { socket }
     }
 }
 
-impl AsyncRead for WsUdpSocket {
+impl AsyncRead for WsUdpStream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         unsafe { self.map_unchecked_mut(|x| &mut x.socket) }
             .poll_recv_from(cx, buf)
@@ -320,7 +320,7 @@ impl AsyncRead for WsUdpSocket {
     }
 }
 
-impl AsyncWrite for WsUdpSocket {
+impl AsyncWrite for WsUdpStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
         unsafe { self.map_unchecked_mut(|x| &mut x.socket) }.poll_send(cx, buf)
     }
@@ -340,7 +340,7 @@ pub async fn connect(
     connect_timeout: Duration,
     so_mark: SoMark,
     dns_resolver: &DnsResolver,
-) -> anyhow::Result<WsUdpSocket> {
+) -> anyhow::Result<WsUdpStream> {
     info!("Opening UDP connection to {}:{}", host, port);
 
     let socket_addrs: Vec<SocketAddr> = match host {
@@ -423,7 +423,7 @@ pub async fn connect(
     }
 
     if let Some(cnx) = cnx {
-        Ok(WsUdpSocket::new(Arc::new(cnx)))
+        Ok(WsUdpStream::new(Arc::new(cnx)))
     } else {
         Err(anyhow!("Cannot connect to udp peer {host}:{port} reason {last_err:?}"))
     }

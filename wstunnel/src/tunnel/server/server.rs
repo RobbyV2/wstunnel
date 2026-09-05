@@ -5,16 +5,19 @@ use crate::protocols::tls;
 use crate::restrictions::config_reloader::RestrictionsRulesReloader;
 use crate::restrictions::types::{RestrictionConfig, RestrictionsRules};
 use crate::somark::SoMark;
-use crate::tunnel::connectors::{TcpTunnelConnector, TunnelConnector, UdpTunnelConnector};
-use crate::tunnel::listeners::{HttpProxyTunnelListener, Socks5TunnelListener, TcpTunnelListener, UdpTunnelListener};
+use crate::tunnel::downstream_listeners::{
+    HttpProxyDownstreamListener, Socks5DownstreamListener, TcpDownstreamListener, UdpDownstreamListener,
+};
 use crate::tunnel::server::handler_http2::http_server_upgrade;
 use crate::tunnel::server::handler_websocket::ws_server_upgrade;
+use crate::tunnel::server::handler_webtransport;
 use crate::tunnel::server::reverse_tunnel::ReverseTunnelServer;
 use crate::tunnel::server::utils::{
     HttpResponse, bad_request, extract_authorization, extract_path_prefix, extract_tunnel_info,
     extract_x_forwarded_for, find_mapped_port, validate_tunnel,
 };
 use crate::tunnel::tls_reloader::TlsReloader;
+use crate::tunnel::upstream_connectors::{TcpUpstreamConnector, UdpUpstreamConnector, UpstreamConnector};
 use crate::tunnel::{LocalProtocol, RemoteAddr, try_to_sock_addr};
 use ahash::AHasher;
 use anyhow::{Context, anyhow};
@@ -53,7 +56,7 @@ pub struct TlsServerConfig {
     pub tls_client_ca_certs_path: Option<PathBuf>,
 }
 
-pub struct WsServerConfig {
+pub struct ServerConfig {
     pub socket_so_mark: SoMark,
     pub bind: SocketAddr,
     pub websocket_ping_frequency: Option<Duration>,
@@ -64,28 +67,36 @@ pub struct WsServerConfig {
     pub restriction_config: Option<PathBuf>,
     pub http_proxy: Option<Url>,
     pub remote_server_idle_timeout: Duration,
+    /// Additionally serve WebTransport over UDP on the same port as the TCP listener.
+    /// Requires TLS, since QUIC mandates TLS 1.3.
+    pub enable_webtransport: bool,
 }
 
 #[derive(Clone)]
-pub struct WsServer<E: crate::TokioExecutorRef = DefaultTokioExecutor> {
-    pub config: Arc<WsServerConfig>,
+pub struct Server<E: crate::TokioExecutorRef = DefaultTokioExecutor> {
+    pub config: Arc<ServerConfig>,
     pub executor: E,
 }
 
-impl<E: crate::TokioExecutorRef> WsServer<E> {
-    pub fn new(config: WsServerConfig, executor: E) -> Self {
+impl<E: crate::TokioExecutorRef> Server<E> {
+    pub fn new(config: ServerConfig, executor: E) -> Self {
         Self {
             config: Arc::new(config),
             executor,
         }
     }
 
-    pub(super) async fn handle_tunnel_request(
+    /// Validate an incoming tunnel request and open the tunnel to its destination.
+    ///
+    /// Generic over the body type because only the headers and uri are read: the websocket and
+    /// http2 handlers pass a `Request<Incoming>`, while the webtransport handler rebuilds a
+    /// `Request<()>` from the HTTP/3 CONNECT request, which has no hyper body.
+    pub(super) async fn handle_tunnel_request<B>(
         &self,
         restrictions: Arc<RestrictionsRules>,
         restrict_path_prefix: Option<String>,
         mut client_addr: SocketAddr,
-        req: &Request<Incoming>,
+        req: &Request<B>,
     ) -> Result<
         (
             RemoteAddr,
@@ -157,7 +168,7 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
     ) -> anyhow::Result<(RemoteAddr, Pin<Box<dyn AsyncRead + Send>>, Pin<Box<dyn AsyncWrite + Send>>)> {
         match remote.protocol {
             LocalProtocol::Udp { timeout, .. } => {
-                let connector = UdpTunnelConnector::new(
+                let connector = UdpUpstreamConnector::new(
                     &remote.host,
                     remote.port,
                     self.config.socket_so_mark,
@@ -172,7 +183,7 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
                 Ok((remote, Box::pin(rx), Box::pin(tx)))
             }
             LocalProtocol::Tcp { proxy_protocol } => {
-                let connector = TcpTunnelConnector::new(
+                let connector = TcpUpstreamConnector::new(
                     &remote.host,
                     remote.port,
                     self.config.socket_so_mark,
@@ -212,13 +223,13 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
                 Ok((remote, Box::pin(rx), Box::pin(tx)))
             }
             LocalProtocol::ReverseTcp => {
-                static SERVERS: LazyLock<ReverseTunnelServer<TcpTunnelListener>> =
+                static SERVERS: LazyLock<ReverseTunnelServer<TcpDownstreamListener>> =
                     LazyLock::new(ReverseTunnelServer::new);
 
                 let remote_port = find_mapped_port(remote.port, restriction);
                 let local_srv = (remote.host, remote_port);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server = async { TcpTunnelListener::new(bind, local_srv.clone(), false).await };
+                let listening_server = async { TcpDownstreamListener::new(bind, local_srv.clone(), false).await };
                 let ((local_rx, local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
@@ -231,13 +242,13 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
                 Ok((remote, Box::pin(local_rx), Box::pin(local_tx)))
             }
             LocalProtocol::ReverseUdp { timeout } => {
-                static SERVERS: LazyLock<ReverseTunnelServer<UdpTunnelListener>> =
+                static SERVERS: LazyLock<ReverseTunnelServer<UdpDownstreamListener>> =
                     LazyLock::new(ReverseTunnelServer::new);
 
                 let remote_port = find_mapped_port(remote.port, restriction);
                 let local_srv = (remote.host, remote_port);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server = async { UdpTunnelListener::new(bind, local_srv.clone(), timeout).await };
+                let listening_server = async { UdpDownstreamListener::new(bind, local_srv.clone(), timeout).await };
                 let ((local_rx, local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
@@ -249,14 +260,14 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
                 Ok((remote, Box::pin(local_rx), Box::pin(local_tx)))
             }
             LocalProtocol::ReverseSocks5 { timeout, credentials } => {
-                static SERVERS: LazyLock<ReverseTunnelServer<Socks5TunnelListener>> =
+                static SERVERS: LazyLock<ReverseTunnelServer<Socks5DownstreamListener>> =
                     LazyLock::new(ReverseTunnelServer::new);
 
                 let remote_port = find_mapped_port(remote.port, restriction);
                 let local_srv = (remote.host, remote_port);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server = async { Socks5TunnelListener::new(bind, timeout, credentials).await };
-                let ((local_rx, local_tx), remote) = SERVERS
+                let listening_server = async { Socks5DownstreamListener::new(bind, timeout, credentials).await };
+                let ((local_rx, mut local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
                         bind,
@@ -265,16 +276,25 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
                     )
                     .await?;
 
+                // Send the deferred SOCKS5 reply now that a reverse-tunnel client has picked up the
+                // connection. On the reverse path the actual target connection happens on the far
+                // wstunnel client side, so the server cannot know whether the target was reached;
+                // acknowledging success here is the best achievable (and mandatory, otherwise the
+                // write half stays pending forever).
+                use crate::tunnel::downstream_listeners::DownstreamWrite;
+                let _ = local_tx.on_tunnel_ready(Ok(())).await;
+
                 Ok((remote, Box::pin(local_rx), Box::pin(local_tx)))
             }
             LocalProtocol::ReverseHttpProxy { timeout, credentials } => {
-                static SERVERS: LazyLock<ReverseTunnelServer<HttpProxyTunnelListener>> =
+                static SERVERS: LazyLock<ReverseTunnelServer<HttpProxyDownstreamListener>> =
                     LazyLock::new(ReverseTunnelServer::new);
 
                 let remote_port = find_mapped_port(remote.port, restriction);
                 let local_srv = (remote.host, remote_port);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server = async { HttpProxyTunnelListener::new(bind, timeout, credentials, false).await };
+                let listening_server =
+                    async { HttpProxyDownstreamListener::new(bind, timeout, credentials, false).await };
                 let ((local_rx, local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
@@ -288,8 +308,8 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
             }
             #[cfg(unix)]
             LocalProtocol::ReverseUnix { ref path } => {
-                use crate::tunnel::listeners::UnixTunnelListener;
-                static SERVERS: LazyLock<ReverseTunnelServer<UnixTunnelListener>> =
+                use crate::tunnel::downstream_listeners::UnixDownstreamListener;
+                static SERVERS: LazyLock<ReverseTunnelServer<UnixDownstreamListener>> =
                     LazyLock::new(ReverseTunnelServer::new);
 
                 // we hash the unix socket path to generate a unique host
@@ -301,7 +321,7 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
 
                 let local_srv = (host, 0);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server = async { UnixTunnelListener::new(path, local_srv, false).await };
+                let listening_server = async { UnixDownstreamListener::new(path, local_srv, false).await };
                 let ((local_rx, local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
@@ -334,7 +354,7 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
         info!("Starting wstunnel server listening on {}", self.config.bind);
 
         // setup upgrade request handler
-        let mk_websocket_upgrade_fn = |server: WsServer<_>,
+        let mk_websocket_upgrade_fn = |server: Server<_>,
                                        restrictions: Arc<ArcSwap<RestrictionsRules>>,
                                        restrict_path: Option<String>,
                                        client_addr: SocketAddr| {
@@ -351,7 +371,7 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
             }
         };
 
-        let mk_http_upgrade_fn = |server: WsServer<_>,
+        let mk_http_upgrade_fn = |server: Server<_>,
                                   restrictions: Arc<ArcSwap<RestrictionsRules>>,
                                   restrict_path: Option<String>,
                                   client_addr: SocketAddr| {
@@ -368,7 +388,7 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
             }
         };
 
-        let mk_auto_upgrade_fn = |server: WsServer<_>,
+        let mk_auto_upgrade_fn = |server: Server<_>,
                                   restrictions: Arc<ArcSwap<RestrictionsRules>>,
                                   restrict_path: Option<String>,
                                   client_addr: SocketAddr| {
@@ -423,6 +443,24 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
         let listener = TcpListener::bind(&self.config.bind)
             .await
             .with_context(|| format!("Failed to bind to socket on {}", self.config.bind))?;
+
+        // WebTransport needs its own UDP socket, so it runs as a sibling of the TCP accept loop
+        // below. One server process then answers websocket, http2 and webtransport clients.
+        if self.config.enable_webtransport {
+            if self.config.tls.is_none() {
+                return Err(anyhow!(
+                    "--enable-webtransport requires TLS: QUIC mandates TLS 1.3, so it cannot be served on a cleartext ws:// or http:// endpoint. Use wss:// or wts://."
+                ));
+            }
+
+            let server = self.clone();
+            let restrictions = restrictions.restrictions_rules().clone();
+            self.executor.spawn(async move {
+                if let Err(err) = handler_webtransport::run_webtransport_server(server, restrictions).await {
+                    error!("Webtransport server stopped: {err:?}");
+                }
+            });
+        }
 
         loop {
             let (stream, peer_addr) = match listener.accept().await {
@@ -539,9 +577,9 @@ fn mk_span() -> Span {
     )
 }
 
-impl Debug for WsServerConfig {
+impl Debug for ServerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WsServerConfig")
+        f.debug_struct("ServerConfig")
             .field("socket_so_mark", &self.socket_so_mark)
             .field("bind", &self.bind)
             .field("websocket_ping_frequency", &self.websocket_ping_frequency)
@@ -550,6 +588,7 @@ impl Debug for WsServerConfig {
             .field("restriction_config", &self.restriction_config)
             .field("tls", &self.tls.is_some())
             .field("remote_server_idle_timeout", &self.remote_server_idle_timeout)
+            .field("enable_webtransport", &self.enable_webtransport)
             .field(
                 "mTLS",
                 &self

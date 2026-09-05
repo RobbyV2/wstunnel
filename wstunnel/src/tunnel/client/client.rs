@@ -1,13 +1,13 @@
 use crate::executor::{DefaultTokioExecutor, TokioExecutorRef};
 use crate::tunnel;
-use crate::tunnel::RemoteAddr;
-use crate::tunnel::client::WsClientConfig;
-use crate::tunnel::client::cnx_pool::WsConnection;
-use crate::tunnel::connectors::TunnelConnector;
-use crate::tunnel::listeners::TunnelListener;
+use crate::tunnel::client::ClientConfig;
+use crate::tunnel::client::connection_pool::L4StreamManager;
+use crate::tunnel::downstream_listeners::{DownstreamListener, DownstreamRead, DownstreamWrite};
 use crate::tunnel::tls_reloader::TlsReloader;
-use crate::tunnel::transport::io::{TunnelReader, TunnelWriter};
+use crate::tunnel::transport::io::{TransportReader, TransportWriter};
 use crate::tunnel::transport::{TransportScheme, jwt_token_to_tunnel};
+use crate::tunnel::upstream_connectors::UpstreamConnector;
+use crate::tunnel::{LocalProtocol, RemoteAddr};
 use anyhow::Context;
 use futures_util::pin_mut;
 use hyper::header::COOKIE;
@@ -15,7 +15,6 @@ use log::debug;
 use std::cmp::min;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 use tracing::{Instrument, Level, Span, error, event, span};
@@ -23,24 +22,25 @@ use url::Host;
 use uuid::Uuid;
 
 #[derive(Clone)]
-pub struct WsClient<E: TokioExecutorRef = DefaultTokioExecutor> {
-    pub config: Arc<WsClientConfig>,
-    pub cnx_pool: bb8::Pool<WsConnection>,
+pub struct Client<E: TokioExecutorRef = DefaultTokioExecutor> {
+    pub config: Arc<ClientConfig>,
+    pub cnx_pool: bb8::Pool<L4StreamManager>,
     reverse_tunnel_connection_retry_max_backoff: Duration,
     _tls_reloader: Arc<TlsReloader>,
     pub(crate) executor: E,
 }
 
-impl<E: TokioExecutorRef> WsClient<E> {
+impl<E: TokioExecutorRef> Client<E> {
     pub async fn new(
-        config: WsClientConfig,
+        config: ClientConfig,
         connection_min_idle: u32,
         connection_retry_max_backoff: Duration,
         reverse_tunnel_connection_retry_max_backoff: Duration,
         executor: E,
     ) -> anyhow::Result<Self> {
         let config = Arc::new(config);
-        let cnx = WsConnection::new(config.clone());
+
+        let cnx = L4StreamManager::new(config.clone());
         let tls_reloader = TlsReloader::new_for_client(config.clone()).with_context(|| "Cannot create tls reloader")?;
         let cnx_pool = bb8::Pool::builder()
             .max_size(1000)
@@ -67,25 +67,61 @@ impl<E: TokioExecutorRef> WsClient<E> {
         duplex_stream: (R, W),
     ) -> anyhow::Result<()>
     where
-        R: AsyncRead + Send + 'static,
-        W: AsyncWrite + Send + 'static,
+        R: DownstreamRead,
+        W: DownstreamWrite,
     {
-        // Connect to server with the correct protocol
-        let (ws_rx, ws_tx, response) = match self.config.remote_addr.scheme() {
+        // Connect to server with the correct protocol. Capture the result instead of `?`-ing it: on
+        // failure we must still acknowledge the local handshake (e.g. send a SOCKS5 error reply)
+        // before bubbling the error up.
+        let connect_result = match self.config.remote_addr.scheme() {
             TransportScheme::Ws | TransportScheme::Wss => {
                 tunnel::transport::websocket::connect(request_id, self, remote_cfg)
                     .await
-                    .map(|(r, w, response)| (TunnelReader::Websocket(r), TunnelWriter::Websocket(w), response))?
+                    .map(|(r, w, response)| (TransportReader::Websocket(r), TransportWriter::Websocket(w), response))
             }
             TransportScheme::Http | TransportScheme::Https => {
                 tunnel::transport::http2::connect(request_id, self, remote_cfg)
                     .await
-                    .map(|(r, w, response)| (TunnelReader::Http2(r), TunnelWriter::Http2(w), response))?
+                    .map(|(r, w, response)| (TransportReader::Http2(r), TransportWriter::Http2(w), response))
+            }
+            TransportScheme::Wts => tunnel::transport::webtransport::connect(request_id, self, remote_cfg)
+                .await
+                .map(|(r, w, response)| {
+                    if matches!(remote_cfg.protocol, LocalProtocol::Udp { .. } | LocalProtocol::TProxyUdp { .. }) {
+                        (
+                            TransportReader::WebTransportUdp(Box::new(r.into_udp_stream())),
+                            TransportWriter::WebTransportUdp(Box::new(w.into_udp_stream())),
+                            response,
+                        )
+                    } else {
+                        (
+                            TransportReader::WebTransport(Box::new(r)),
+                            TransportWriter::WebTransport(Box::new(w)),
+                            response,
+                        )
+                    }
+                }),
+        };
+
+        let (local_rx, mut local_tx) = duplex_stream;
+
+        // Acknowledge the tunnel outcome to the local client (no-op for protocols without a
+        // handshake). A successful transport connect means the server accepted the request and
+        // reached the target, so this is the moment to reply success; otherwise reply failure.
+        let (ws_rx, ws_tx, response) = match connect_result {
+            Ok(tunnel) => {
+                if let Err(err) = local_tx.on_tunnel_ready(Ok(())).await {
+                    return Err(anyhow::Error::new(err).context("failed to acknowledge local tunnel handshake"));
+                }
+                tunnel
+            }
+            Err(err) => {
+                let _ = local_tx.on_tunnel_ready(Err(&err)).await;
+                return Err(err);
             }
         };
 
         debug!("Server response: {response:?}");
-        let (local_rx, local_tx) = duplex_stream;
         let (close_tx, close_rx) = oneshot::channel::<()>();
 
         // Forward local tx to websocket tx
@@ -101,7 +137,7 @@ impl<E: TokioExecutorRef> WsClient<E> {
         Ok(())
     }
 
-    pub async fn run_tunnel(self, tunnel_listener: impl TunnelListener) -> anyhow::Result<()> {
+    pub async fn run_tunnel(self, tunnel_listener: impl DownstreamListener) -> anyhow::Result<()> {
         pin_mut!(tunnel_listener);
         // everybody who connects to the local socket gets their own tunnel
         while let Some(cnx) = tunnel_listener.next().await {
@@ -138,7 +174,7 @@ impl<E: TokioExecutorRef> WsClient<E> {
     pub async fn run_reverse_tunnel(
         self,
         remote_addr: RemoteAddr,
-        connector: impl TunnelConnector,
+        connector: impl UpstreamConnector,
     ) -> anyhow::Result<()> {
         fn new_reconnect_delay(max_delay: Duration) -> impl FnMut() -> Duration {
             let mut reconnect_delay = Duration::from_secs(1);
@@ -167,7 +203,9 @@ impl<E: TokioExecutorRef> WsClient<E> {
                         .instrument(span.clone())
                         .await
                     {
-                        Ok((r, w, response)) => (TunnelReader::Websocket(r), TunnelWriter::Websocket(w), response),
+                        Ok((r, w, response)) => {
+                            (TransportReader::Websocket(r), TransportWriter::Websocket(w), response)
+                        }
                         Err(err) => {
                             let reconnect_delay = reconnect_delay();
                             event!(parent: &span, Level::ERROR, "Retrying in {:?}, cannot connect to remote server: {:?}", reconnect_delay, err);
@@ -181,7 +219,25 @@ impl<E: TokioExecutorRef> WsClient<E> {
                         .instrument(span.clone())
                         .await
                     {
-                        Ok((r, w, response)) => (TunnelReader::Http2(r), TunnelWriter::Http2(w), response),
+                        Ok((r, w, response)) => (TransportReader::Http2(r), TransportWriter::Http2(w), response),
+                        Err(err) => {
+                            let reconnect_delay = reconnect_delay();
+                            event!(parent: &span, Level::ERROR, "Retrying in {:?}, cannot connect to remote server: {:?}", reconnect_delay, err);
+                            tokio::time::sleep(reconnect_delay).await;
+                            continue;
+                        }
+                    }
+                }
+                TransportScheme::Wts => {
+                    match tunnel::transport::webtransport::connect(request_id, &client, &remote_addr)
+                        .instrument(span.clone())
+                        .await
+                    {
+                        Ok((r, w, response)) => (
+                            TransportReader::WebTransport(Box::new(r)),
+                            TransportWriter::WebTransport(Box::new(w)),
+                            response,
+                        ),
                         Err(err) => {
                             let reconnect_delay = reconnect_delay();
                             event!(parent: &span, Level::ERROR, "Retrying in {:?}, cannot connect to remote server: {:?}", reconnect_delay, err);

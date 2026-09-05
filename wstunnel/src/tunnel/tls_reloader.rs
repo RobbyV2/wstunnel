@@ -1,14 +1,14 @@
 use crate::protocols::tls;
-use crate::tunnel::client::WsClientConfig;
-use crate::tunnel::server::WsServerConfig;
+use crate::tunnel::client::ClientConfig;
+use crate::tunnel::server::ServerConfig;
 use crate::tunnel::tls_reloader::TlsReloaderState::{Client, Server};
 use anyhow::Context;
 use log::trace;
 use notify::{Config, EventKind, PollWatcher, RecommendedWatcher, Watcher};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -26,7 +26,8 @@ fn poll_watcher<F: notify::EventHandler>(handler: F, paths: &[&Path]) -> anyhow:
     let config = Config::default()
         .with_poll_interval(POLL_INTERVAL)
         .with_compare_contents(true);
-    let mut watcher = PollWatcher::new(handler, config).with_context(|| "Cannot create tls certificate poll watcher")?;
+    let mut watcher =
+        PollWatcher::new(handler, config).with_context(|| "Cannot create tls certificate poll watcher")?;
     for path in paths {
         watcher.watch(path, notify::RecursiveMode::NonRecursive)?;
     }
@@ -49,7 +50,8 @@ where
     H: notify::EventHandler,
     F: FnMut() -> H,
 {
-    let mut inotify = notify::recommended_watcher(make_handler()).with_context(|| "Cannot create tls certificate watcher")?;
+    let mut inotify =
+        notify::recommended_watcher(make_handler()).with_context(|| "Cannot create tls certificate watcher")?;
     for path in paths {
         inotify.watch(path, notify::RecursiveMode::NonRecursive)?;
     }
@@ -82,7 +84,7 @@ struct TlsReloaderServerState {
     fs_watcher: Mutex<RecommendedWatcher>,
     poll_watcher: Mutex<PollWatcher>,
     tls_reload_certificate: AtomicBool,
-    server_config: Arc<WsServerConfig>,
+    server_config: Arc<ServerConfig>,
     cert_path: PathBuf,
     key_path: PathBuf,
     client_ca_path: Option<PathBuf>,
@@ -126,7 +128,7 @@ struct TlsReloaderClientState {
     fs_watcher: Mutex<RecommendedWatcher>,
     poll_watcher: Mutex<PollWatcher>,
     tls_reload_certificate: AtomicBool,
-    client_config: Arc<WsClientConfig>,
+    client_config: Arc<ClientConfig>,
     cert_path: PathBuf,
     key_path: PathBuf,
 }
@@ -172,7 +174,7 @@ pub struct TlsReloader {
 }
 
 impl TlsReloader {
-    pub fn new_for_server(server_config: Arc<WsServerConfig>) -> anyhow::Result<Self> {
+    pub fn new_for_server(server_config: Arc<ServerConfig>) -> anyhow::Result<Self> {
         // If there is no custom certificate and private key, there is nothing to watch
         let Some((Some(cert_path), Some(key_path), client_ca_certs)) = server_config
             .tls
@@ -210,7 +212,7 @@ impl TlsReloader {
         Ok(Self { state: Server(this) })
     }
 
-    pub fn new_for_client(client_config: Arc<WsClientConfig>) -> anyhow::Result<Self> {
+    pub fn new_for_client(client_config: Arc<ClientConfig>) -> anyhow::Result<Self> {
         // If there is no custom certificate and private key, there is nothing to watch
         let Some((Some(cert_path), Some(key_path))) = client_config
             .remote_addr

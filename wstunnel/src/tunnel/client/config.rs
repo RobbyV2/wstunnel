@@ -1,6 +1,7 @@
 use crate::protocols::dns::DnsResolver;
 use crate::somark::SoMark;
 use crate::tunnel::transport::TransportAddr;
+use crate::tunnel::transport::webtransport::WebTransportEndpoint;
 use hyper::header::{HeaderName, HeaderValue};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -13,7 +14,7 @@ use tokio_rustls::rustls::pki_types::{DnsName, ServerName};
 use url::{Host, Url};
 
 #[derive(Clone, Debug)]
-pub struct WsClientConfig {
+pub struct ClientConfig {
     pub remote_addr: TransportAddr,
     pub socket_so_mark: SoMark,
     pub http_upgrade_path_prefix: String,
@@ -26,9 +27,26 @@ pub struct WsClientConfig {
     pub websocket_mask_frame: bool,
     pub http_proxy: Option<Url>,
     pub dns_resolver: DnsResolver,
+    /// QUIC endpoint, only for the webtransport transport. `None` for every other scheme.
+    /// Built in `create_client`, so a bad TLS setup fails at startup rather than on the
+    /// first tunnel.
+    pub webtransport: Option<Arc<WebTransportEndpoint>>,
 }
 
-impl WsClientConfig {
+impl ClientConfig {
+    pub fn quic_server_name(&self) -> String {
+        self.remote_addr
+            .tls()
+            .and_then(|tls| tls.tls_sni_override.as_ref())
+            .map_or_else(
+                || match &self.remote_addr.host() {
+                    Host::Domain(domain) => domain.clone(),
+                    Host::Ipv4(ip) => ip.to_string(),
+                    Host::Ipv6(ip) => ip.to_string(),
+                },
+                |sni_override| sni_override.as_ref().to_string(),
+            )
+    }
     pub fn tls_server_name(&self) -> ServerName<'static> {
         static INVALID_DNS_NAME: LazyLock<DnsName> =
             LazyLock::new(|| DnsName::try_from("dns-name-invalid.com").unwrap());

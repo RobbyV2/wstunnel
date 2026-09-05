@@ -1,11 +1,12 @@
-use super::io::{MAX_PACKET_LENGTH, TunnelRead, TunnelWrite};
+use super::io::{MAX_PACKET_LENGTH, TransportRead, TransportWrite};
 use crate::tunnel::RemoteAddr;
-use crate::tunnel::client::WsClient;
-use crate::tunnel::client::l4_transport_stream::{TransportReadHalf, TransportStream, TransportWriteHalf};
+use crate::tunnel::client::Client;
+use crate::tunnel::client::connection_pool::{L4ReadHalf, L4Stream, L4WriteHalf};
 use crate::tunnel::transport::headers_from_file;
 use crate::tunnel::transport::jwt::{JWT_HEADER_PREFIX, tunnel_to_jwt_token};
 use anyhow::{Context, anyhow};
 use bytes::{Bytes, BytesMut};
+use either::Either;
 use fastwebsockets::{CloseCode, Frame, OpCode, Payload, Role, WebSocket, WebSocketRead, WebSocketWrite};
 use http_body_util::Empty;
 use hyper::Request;
@@ -18,7 +19,6 @@ use hyper_util::rt::TokioIo;
 use log::debug;
 use std::io;
 use std::io::ErrorKind;
-use std::ops::DerefMut;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
@@ -31,17 +31,17 @@ use tokio_rustls::server::TlsStream;
 use tracing::trace;
 use uuid::Uuid;
 
-pub struct WebsocketTunnelWrite {
-    inner: WebSocketWrite<TransportWriteHalf>,
+pub struct WebsocketTransportWrite {
+    inner: WebSocketWrite<L4WriteHalf>,
     buf: BytesMut,
     pending_operations: Receiver<Frame<'static>>,
     pending_ops_notify: Arc<Notify>,
     in_flight_ping: Arc<AtomicUsize>,
 }
 
-impl WebsocketTunnelWrite {
+impl WebsocketTransportWrite {
     pub fn new(
-        ws: WebSocketWrite<TransportWriteHalf>,
+        ws: WebSocketWrite<L4WriteHalf>,
         (pending_operations, notify): (Receiver<Frame<'static>>, Arc<Notify>),
         in_flight_ping: Arc<AtomicUsize>,
     ) -> Self {
@@ -55,7 +55,7 @@ impl WebsocketTunnelWrite {
     }
 }
 
-impl TunnelWrite for WebsocketTunnelWrite {
+impl TransportWrite for WebsocketTransportWrite {
     fn buf_mut(&mut self) -> &mut BytesMut {
         &mut self.buf
     }
@@ -82,16 +82,16 @@ impl TunnelWrite for WebsocketTunnelWrite {
 
         // If the buffer has been completely filled with previous read, Grows it !
         // For the buffer to not be a bottleneck when the TCP window scale.
-        // We clamp it to 32Mb to avoid unbounded growth and as websocket max frame size is 64Mb by default
+        // We clamp it to 128KB to avoid unbounded growth and as websocket max frame size is 64Mb by default
         // For udp, the buffer will never grow.
-        const _32_MB: usize = 32 * 1024 * 1024;
+        const _128_KB: usize = 128 * 1024;
         buf.clear();
-        if buf.capacity() == read_len && buf.capacity() < _32_MB {
-            let new_size = buf.capacity() + (buf.capacity() / 4); // grow buffer by 1.25 %
+        if buf.capacity() == read_len && buf.capacity() < _128_KB {
+            let new_size = (buf.capacity() + (buf.capacity() / 4)).min(_128_KB); // grow buffer by 1.25 %
             buf.reserve(new_size);
             trace!(
-                "Buffer {} Mb {} {} {}",
-                buf.capacity() as f64 / 1024.0 / 1024.0,
+                "Buffer {} KB {} {} {}",
+                buf.capacity() as f64 / 1024.0,
                 new_size,
                 buf.len(),
                 buf.capacity()
@@ -159,16 +159,16 @@ impl TunnelWrite for WebsocketTunnelWrite {
     }
 }
 
-pub struct WebsocketTunnelRead {
-    inner: WebSocketRead<TransportReadHalf>,
+pub struct WebsocketTransportRead {
+    inner: WebSocketRead<L4ReadHalf>,
     pending_operations: Sender<Frame<'static>>,
     notify_pending_ops: Arc<Notify>,
     in_flight_ping: Arc<AtomicUsize>,
 }
 
-impl WebsocketTunnelRead {
+impl WebsocketTransportRead {
     pub fn new(
-        ws: WebSocketRead<TransportReadHalf>,
+        ws: WebSocketRead<L4ReadHalf>,
         in_flight_ping: Arc<AtomicUsize>,
     ) -> (Self, (Receiver<Frame<'static>>, Arc<Notify>)) {
         let (tx, rx) = tokio::sync::mpsc::channel(10);
@@ -190,7 +190,7 @@ fn frame_reader(_: Frame<'_>) -> futures_util::future::Ready<anyhow::Result<()>>
     futures_util::future::ready(anyhow::Ok(()))
 }
 
-impl TunnelRead for WebsocketTunnelRead {
+impl TransportRead for WebsocketTransportRead {
     async fn copy(&mut self, mut writer: impl AsyncWrite + Unpin + Send) -> Result<(), io::Error> {
         loop {
             let msg = match self.inner.read_frame(&mut frame_reader).await {
@@ -253,9 +253,9 @@ impl TunnelRead for WebsocketTunnelRead {
 
 pub async fn connect(
     request_id: Uuid,
-    client: &WsClient<impl crate::TokioExecutorRef>,
+    client: &Client<impl crate::TokioExecutorRef>,
     dest_addr: &RemoteAddr,
-) -> anyhow::Result<(WebsocketTunnelRead, WebsocketTunnelWrite, Parts)> {
+) -> anyhow::Result<(WebsocketTransportRead, WebsocketTransportWrite, Parts)> {
     let client_cfg = &client.config;
     let mut pooled_cnx = match client.cnx_pool.get().await {
         Ok(cnx) => Ok(cnx),
@@ -315,7 +315,11 @@ pub async fn connect(
         )
     })?;
     debug!("with HTTP upgrade request {req:?}");
-    let transport = pooled_cnx.deref_mut().take().unwrap();
+    let transport = pooled_cnx
+        .take()
+        .and_then(Either::left)
+        .ok_or_else(|| anyhow!("the connection pool did not return a TCP stream"))?;
+
     let (ws, response) = fastwebsockets::handshake::client(&TokioExecutor::new(), req, transport)
         .await
         .with_context(|| format!("failed to do websocket handshake with the server {:?}", client_cfg.remote_addr))?;
@@ -328,28 +332,28 @@ pub fn mk_websocket_tunnel(
     ws: WebSocket<TokioIo<Upgraded>>,
     role: Role,
     mask_frame: bool,
-) -> anyhow::Result<(WebsocketTunnelRead, WebsocketTunnelWrite)> {
+) -> anyhow::Result<(WebsocketTransportRead, WebsocketTransportWrite)> {
     let mut ws = match role {
         Role::Client => {
             let stream = ws
                 .into_inner()
                 .into_inner()
-                .downcast::<TokioIo<TransportStream>>()
+                .downcast::<TokioIo<L4Stream>>()
                 .map_err(|_| anyhow!("cannot downcast websocket client stream"))?;
-            let transport = TransportStream::from(stream.io.into_inner(), stream.read_buf);
+            let transport = L4Stream::from(stream.io.into_inner(), stream.read_buf);
             WebSocket::after_handshake(transport, role)
         }
         Role::Server => {
             let upgraded = ws.into_inner().into_inner();
             match upgraded.downcast::<TokioIo<TlsStream<TcpStream>>>() {
                 Ok(stream) => {
-                    let transport = TransportStream::from_server_tls(stream.io.into_inner(), stream.read_buf);
+                    let transport = L4Stream::from_server_tls(stream.io.into_inner(), stream.read_buf);
                     WebSocket::after_handshake(transport, role)
                 }
                 Err(upgraded) => {
                     let stream = hyper_util::server::conn::auto::upgrade::downcast::<TokioIo<TcpStream>>(upgraded)
                         .map_err(|_| anyhow!("cannot downcast websocket server stream"))?;
-                    let transport = TransportStream::from_tcp(stream.io.into_inner(), stream.read_buf);
+                    let transport = L4Stream::from_tcp(stream.io.into_inner(), stream.read_buf);
                     WebSocket::after_handshake(transport, role)
                 }
             }
@@ -362,6 +366,6 @@ pub fn mk_websocket_tunnel(
     let (ws_rx, ws_tx) = ws.split(|x| x.into_split());
 
     let in_flight_ping = Arc::new(AtomicUsize::new(0));
-    let (ws_rx, pending_ops) = WebsocketTunnelRead::new(ws_rx, in_flight_ping.clone());
-    Ok((ws_rx, WebsocketTunnelWrite::new(ws_tx, pending_ops, in_flight_ping)))
+    let (ws_rx, pending_ops) = WebsocketTransportRead::new(ws_rx, in_flight_ping.clone());
+    Ok((ws_rx, WebsocketTransportWrite::new(ws_tx, pending_ops, in_flight_ping)))
 }

@@ -8,20 +8,22 @@ mod somark;
 mod test_integrations;
 pub mod tunnel;
 
-use crate::config::{Client, DEFAULT_CLIENT_UPGRADE_PATH_PREFIX, Server};
+use crate::config::{ClientCreationRequest, DEFAULT_CLIENT_UPGRADE_PATH_PREFIX, ServerCreationRequest};
 use crate::executor::{TokioExecutor, TokioExecutorRef};
 use crate::protocols::dns::DnsResolver;
 use crate::protocols::tls;
 use crate::restrictions::types::RestrictionsRules;
 use crate::somark::SoMark;
 pub use crate::tunnel::LocalProtocol;
-pub use crate::tunnel::client::{TlsClientConfig, WsClient, WsClientConfig};
-use crate::tunnel::connectors::{Socks5TunnelConnector, TcpTunnelConnector, UdpTunnelConnector};
-use crate::tunnel::listeners::{
-    HttpProxyTunnelListener, Socks5TunnelListener, TcpTunnelListener, UdpTunnelListener, new_stdio_listener,
+pub use crate::tunnel::client::{Client, ClientConfig, TlsClientConfig};
+use crate::tunnel::downstream_listeners::{
+    HttpProxyDownstreamListener, Socks5DownstreamListener, TcpDownstreamListener, UdpDownstreamListener,
+    new_stdio_listener,
 };
-use crate::tunnel::server::{TlsServerConfig, WsServer, WsServerConfig};
+use crate::tunnel::server::{Server, ServerConfig, TlsServerConfig};
+use crate::tunnel::transport::webtransport::WebTransportEndpoint;
 use crate::tunnel::transport::{TransportAddr, TransportScheme};
+use crate::tunnel::upstream_connectors::{Socks5UpstreamConnector, TcpUpstreamConnector, UdpUpstreamConnector};
 use crate::tunnel::{RemoteAddr, to_host_port};
 use anyhow::{Context, anyhow};
 use futures_util::future::BoxFuture;
@@ -38,7 +40,7 @@ use tokio::task::JoinSet;
 use tracing::{error, info};
 use url::Url;
 
-pub async fn run_client(args: Client, executor: impl TokioExecutor) -> anyhow::Result<()> {
+pub async fn run_client(args: ClientCreationRequest, executor: impl TokioExecutor) -> anyhow::Result<()> {
     let tunnels = create_client_tunnels(args, executor.ref_clone()).await?;
 
     // Start all tunnels
@@ -54,9 +56,9 @@ pub async fn run_client(args: Client, executor: impl TokioExecutor) -> anyhow::R
 }
 
 pub async fn create_client(
-    args: Client,
+    args: ClientCreationRequest,
     executor: impl TokioExecutorRef,
-) -> anyhow::Result<WsClient<impl TokioExecutorRef>> {
+) -> anyhow::Result<Client<impl TokioExecutorRef>> {
     let (tls_certificate, tls_key) = if let (Some(cert), Some(key)) =
         (args.tls_certificate.as_ref(), args.tls_private_key.as_ref())
     {
@@ -89,9 +91,29 @@ pub async fn create_client(
     .expect("cannot create dns resolver");
 
     let transport_scheme = TransportScheme::from_str(args.remote_addr.scheme()).expect("invalid scheme in server url");
+    if transport_scheme.is_webtransport() {
+        // QUIC runs over UDP, so an HTTP CONNECT proxy cannot carry it.
+        if http_proxy.is_some() {
+            return Err(anyhow!(
+                "--http-proxy cannot be used with wts:// (webtransport): QUIC runs over UDP and cannot traverse an HTTP CONNECT proxy. Use wss:// or https:// instead."
+            ));
+        }
+        // SNI is mandatory to validate the server certificate over QUIC.
+        if args.tls_sni_disable {
+            return Err(anyhow!(
+                "--tls-sni-disable cannot be used with wts:// (webtransport): the QUIC handshake requires a server name. Use wss:// or https:// instead."
+            ));
+        }
+        if args.tls_ech_enable {
+            return Err(anyhow!(
+                "--tls-ech-enable cannot be used with wts:// (webtransport): ECH is only wired for the TCP transports. Use wss:// or https:// instead."
+            ));
+        }
+    }
+
     let tls = match transport_scheme {
         TransportScheme::Ws | TransportScheme::Http => None,
-        TransportScheme::Wss | TransportScheme::Https => {
+        TransportScheme::Wts | TransportScheme::Wss | TransportScheme::Https => {
             let ech_config = if args.tls_ech_enable {
                 #[cfg(not(feature = "aws-lc-rs"))]
                 return Err(anyhow!(
@@ -143,11 +165,45 @@ pub async fn create_client(
         panic!("http headers file does not exists: {}", path.display());
     }
 
-    let client_config = WsClientConfig {
+    let websocket_ping_frequency = args
+        .websocket_ping_frequency
+        .or(Some(Duration::from_secs(30)))
+        .filter(|d| d.as_secs() > 0);
+
+    // Webtransport rides QUIC, so it gets its own endpoint instead of a stream from the TCP
+    // pool. Built here rather than in `Client::new` so a broken TLS setup fails at startup.
+    let webtransport = if transport_scheme.is_webtransport() {
+        let tls = tls
+            .as_ref()
+            .ok_or_else(|| anyhow!("webtransport requires TLS, which is missing from the configuration"))?;
+        let tls_config = tls::quic_client_config(
+            tls.tls_verify_certificate,
+            tls.tls_certificate_path
+                .as_deref()
+                .map(tls::load_certificates_from_pem)
+                .transpose()
+                .with_context(|| "Cannot load client TLS certificate (mTLS)")?,
+            tls.tls_key_path
+                .as_deref()
+                .map(tls::load_private_key_from_file)
+                .transpose()
+                .with_context(|| "Cannot load client TLS private key (mTLS)")?,
+        )
+        .with_context(|| "Cannot create the TLS configuration for webtransport")?;
+
+        Some(Arc::new(
+            WebTransportEndpoint::new(tls_config, SoMark::new(args.socket_so_mark), websocket_ping_frequency)
+                .with_context(|| "Cannot create the webtransport endpoint")?,
+        ))
+    } else {
+        None
+    };
+
+    let client_config = ClientConfig {
         remote_addr: TransportAddr::new(
             TransportScheme::from_str(args.remote_addr.scheme()).unwrap(),
             args.remote_addr.host().unwrap().to_owned(),
-            args.remote_addr.port_or_known_default().unwrap(),
+            args.remote_addr.port_or_known_default().unwrap_or(443),
             tls,
         )
         .unwrap(),
@@ -158,16 +214,14 @@ pub async fn create_client(
         http_headers_file: args.http_headers_file,
         http_header_host: host_header,
         timeout_connect: Duration::from_secs(10),
-        websocket_ping_frequency: args
-            .websocket_ping_frequency
-            .or(Some(Duration::from_secs(30)))
-            .filter(|d| d.as_secs() > 0),
+        websocket_ping_frequency,
         websocket_mask_frame: args.websocket_mask_frame,
         dns_resolver,
         http_proxy,
+        webtransport,
     };
 
-    let client = WsClient::new(
+    let client = Client::new(
         client_config,
         args.connection_min_idle,
         args.connection_retry_max_backoff,
@@ -181,7 +235,7 @@ pub async fn create_client(
 }
 
 async fn create_client_tunnels(
-    mut args: Client,
+    mut args: ClientCreationRequest,
     executor: impl TokioExecutorRef,
 ) -> anyhow::Result<Vec<BoxFuture<'static, ()>>> {
     let remote_to_local = std::mem::take(&mut args.remote_to_local);
@@ -205,7 +259,7 @@ async fn create_client_tunnels(
             LocalProtocol::ReverseTcp => {
                 spawn_tunnel! {
                     let cfg = client.config.clone();
-                    let tcp_connector = TcpTunnelConnector::new(
+                    let tcp_connector = TcpUpstreamConnector::new(
                         &tunnel.remote.0,
                         tunnel.remote.1,
                         cfg.socket_so_mark,
@@ -233,7 +287,7 @@ async fn create_client_tunnels(
                         host,
                         port,
                     };
-                    let udp_connector = UdpTunnelConnector::new(
+                    let udp_connector = UdpUpstreamConnector::new(
                         &tunnel.remote.0,
                         tunnel.remote.1,
                         cfg.socket_so_mark,
@@ -258,7 +312,7 @@ async fn create_client_tunnels(
                         port,
                     };
                     let socks_connector =
-                        Socks5TunnelConnector::new(cfg.socket_so_mark, cfg.timeout_connect, &cfg.dns_resolver);
+                        Socks5UpstreamConnector::new(cfg.socket_so_mark, cfg.timeout_connect, &cfg.dns_resolver);
 
                     if let Err(err) = client.run_reverse_tunnel(remote, socks_connector).await {
                         error!("{:?}", err);
@@ -276,7 +330,7 @@ async fn create_client_tunnels(
                         host,
                         port,
                     };
-                    let tcp_connector = TcpTunnelConnector::new(
+                    let tcp_connector = TcpUpstreamConnector::new(
                         &tunnel.remote.0,
                         tunnel.remote.1,
                         cfg.socket_so_mark,
@@ -294,7 +348,7 @@ async fn create_client_tunnels(
                 info!("Connecting to unix socket {:?}", tunnel);
                 spawn_tunnel! {
                     let cfg = client.config.clone();
-                    let tcp_connector = TcpTunnelConnector::new(
+                    let tcp_connector = TcpUpstreamConnector::new(
                         &tunnel.remote.0,
                         tunnel.remote.1,
                         cfg.socket_so_mark,
@@ -331,7 +385,7 @@ async fn create_client_tunnels(
 
         match &tunnel.local_protocol {
             LocalProtocol::Tcp { proxy_protocol } => {
-                let server = TcpTunnelListener::new(tunnel.local, tunnel.remote.clone(), *proxy_protocol).await?;
+                let server = TcpDownstreamListener::new(tunnel.local, tunnel.remote.clone(), *proxy_protocol).await?;
                 spawn_tunnel! {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
@@ -340,8 +394,8 @@ async fn create_client_tunnels(
             }
             #[cfg(target_os = "linux")]
             LocalProtocol::TProxyTcp => {
-                use crate::tunnel::listeners::TproxyTcpTunnelListener;
-                let server = TproxyTcpTunnelListener::new(tunnel.local, false).await?;
+                use crate::tunnel::downstream_listeners::TProxyTcpDownstreamListener;
+                let server = TProxyTcpDownstreamListener::new(tunnel.local, false).await?;
 
                 spawn_tunnel! {
                     if let Err(err) = client.run_tunnel(server).await {
@@ -351,8 +405,8 @@ async fn create_client_tunnels(
             }
             #[cfg(unix)]
             LocalProtocol::Unix { path, proxy_protocol } => {
-                use crate::tunnel::listeners::UnixTunnelListener;
-                let server = UnixTunnelListener::new(path, tunnel.remote.clone(), *proxy_protocol).await?;
+                use crate::tunnel::downstream_listeners::UnixDownstreamListener;
+                let server = UnixDownstreamListener::new(path, tunnel.remote.clone(), *proxy_protocol).await?;
                 spawn_tunnel! {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
@@ -366,7 +420,7 @@ async fn create_client_tunnels(
 
             #[cfg(target_os = "linux")]
             LocalProtocol::TProxyUdp { timeout } => {
-                use crate::tunnel::listeners::new_tproxy_udp;
+                use crate::tunnel::downstream_listeners::new_tproxy_udp;
                 let server = new_tproxy_udp(tunnel.local, *timeout).await?;
                 spawn_tunnel! {
                     if let Err(err) = client.run_tunnel(server).await {
@@ -379,7 +433,7 @@ async fn create_client_tunnels(
                 panic!("Transparent proxy is not available for non Linux platform")
             }
             LocalProtocol::Udp { timeout } => {
-                let server = UdpTunnelListener::new(tunnel.local, tunnel.remote.clone(), *timeout).await?;
+                let server = UdpDownstreamListener::new(tunnel.local, tunnel.remote.clone(), *timeout).await?;
                 spawn_tunnel! {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
@@ -387,7 +441,7 @@ async fn create_client_tunnels(
                 }
             }
             LocalProtocol::Socks5 { timeout, credentials } => {
-                let server = Socks5TunnelListener::new(tunnel.local, *timeout, credentials.clone()).await?;
+                let server = Socks5DownstreamListener::new(tunnel.local, *timeout, credentials.clone()).await?;
                 spawn_tunnel! {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
@@ -400,7 +454,8 @@ async fn create_client_tunnels(
                 proxy_protocol,
             } => {
                 let server =
-                    HttpProxyTunnelListener::new(tunnel.local, *timeout, credentials.clone(), *proxy_protocol).await?;
+                    HttpProxyDownstreamListener::new(tunnel.local, *timeout, credentials.clone(), *proxy_protocol)
+                        .await?;
                 spawn_tunnel! {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
@@ -434,7 +489,7 @@ async fn create_client_tunnels(
     Ok(tunnels)
 }
 
-pub async fn run_server(args: Server, executor: impl TokioExecutor) -> anyhow::Result<()> {
+pub async fn run_server(args: ServerCreationRequest, executor: impl TokioExecutor) -> anyhow::Result<()> {
     let (tx, rx) = oneshot::channel();
     let exec = executor.ref_clone();
     executor.spawn(async move {
@@ -445,8 +500,10 @@ pub async fn run_server(args: Server, executor: impl TokioExecutor) -> anyhow::R
     rx.await?
 }
 
-async fn run_server_impl(args: Server, executor: impl TokioExecutorRef) -> anyhow::Result<()> {
-    let tls_config = if args.remote_addr.scheme() == "wss" {
+async fn run_server_impl(args: ServerCreationRequest, executor: impl TokioExecutorRef) -> anyhow::Result<()> {
+    // wts:// binds TLS on TCP exactly like wss://, and additionally serves webtransport over UDP.
+    let is_webtransport = args.remote_addr.scheme() == "wts";
+    let tls_config = if args.remote_addr.scheme() == "wss" || is_webtransport {
         let tls_certificate = if let Some(cert_path) = &args.tls_certificate {
             tls::load_certificates_from_pem(cert_path).expect("Cannot load tls certificate")
         } else {
@@ -502,7 +559,7 @@ async fn run_server_impl(args: Server, executor: impl TokioExecutorRef) -> anyho
     };
 
     let http_proxy = mk_http_proxy(args.http_proxy, args.http_proxy_login, args.http_proxy_password)?;
-    let server_config = WsServerConfig {
+    let server_config = ServerConfig {
         socket_so_mark: SoMark::new(args.socket_so_mark),
         bind: args.remote_addr.socket_addrs(|| Some(8080))?[0],
         websocket_ping_frequency: args
@@ -522,8 +579,11 @@ async fn run_server_impl(args: Server, executor: impl TokioExecutorRef) -> anyho
         restriction_config: args.restrict_config,
         http_proxy,
         remote_server_idle_timeout: args.remote_to_local_server_idle_timeout,
+        // wts:// on the server means "TLS, and also serve webtransport", so it implies the flag.
+        // The TCP listener still runs, serving websocket and http2 as usual.
+        enable_webtransport: args.enable_webtransport || is_webtransport,
     };
-    let server = WsServer::new(server_config, executor);
+    let server = Server::new(server_config, executor);
 
     info!(
         "Starting wstunnel server v{} with config {:?}",

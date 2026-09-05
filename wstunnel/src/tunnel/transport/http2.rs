@@ -1,10 +1,11 @@
-use super::io::{MAX_PACKET_LENGTH, TunnelRead, TunnelWrite};
+use super::io::{MAX_PACKET_LENGTH, TransportRead, TransportWrite};
 use crate::tunnel::RemoteAddr;
-use crate::tunnel::client::WsClient;
+use crate::tunnel::client::Client;
 use crate::tunnel::transport::jwt::tunnel_to_jwt_token;
 use crate::tunnel::transport::{TransportScheme, headers_from_file};
 use anyhow::{Context, anyhow};
 use bytes::{Bytes, BytesMut};
+use either::Either;
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use hyper::Request;
 use hyper::body::{Frame, Incoming};
@@ -15,7 +16,6 @@ use log::{debug, error, warn};
 use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
-use std::ops::DerefMut;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -25,18 +25,18 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-pub struct Http2TunnelRead {
+pub struct Http2TransportRead {
     inner: BodyStream<Incoming>,
     cnx_poller: Option<AbortHandle>,
 }
 
-impl Http2TunnelRead {
+impl Http2TransportRead {
     pub const fn new(inner: BodyStream<Incoming>, cnx_poller: Option<AbortHandle>) -> Self {
         Self { inner, cnx_poller }
     }
 }
 
-impl Drop for Http2TunnelRead {
+impl Drop for Http2TransportRead {
     fn drop(&mut self) {
         if let Some(t) = self.cnx_poller.as_ref() {
             t.abort()
@@ -44,7 +44,7 @@ impl Drop for Http2TunnelRead {
     }
 }
 
-impl TunnelRead for Http2TunnelRead {
+impl TransportRead for Http2TransportRead {
     async fn copy(&mut self, mut writer: impl AsyncWrite + Unpin + Send) -> Result<(), io::Error> {
         loop {
             match self.inner.next().await {
@@ -69,12 +69,12 @@ impl TunnelRead for Http2TunnelRead {
     }
 }
 
-pub struct Http2TunnelWrite {
+pub struct Http2TransportWrite {
     inner: mpsc::Sender<Bytes>,
     buf: BytesMut,
 }
 
-impl Http2TunnelWrite {
+impl Http2TransportWrite {
     pub fn new(inner: mpsc::Sender<Bytes>) -> Self {
         Self {
             inner,
@@ -83,7 +83,7 @@ impl Http2TunnelWrite {
     }
 }
 
-impl TunnelWrite for Http2TunnelWrite {
+impl TransportWrite for Http2TransportWrite {
     fn buf_mut(&mut self) -> &mut BytesMut {
         &mut self.buf
     }
@@ -122,9 +122,9 @@ impl TunnelWrite for Http2TunnelWrite {
 
 pub async fn connect(
     request_id: Uuid,
-    client: &WsClient<impl crate::TokioExecutorRef>,
+    client: &Client<impl crate::TokioExecutorRef>,
     dest_addr: &RemoteAddr,
-) -> anyhow::Result<(Http2TunnelRead, Http2TunnelWrite, Parts)> {
+) -> anyhow::Result<(Http2TransportRead, Http2TransportWrite, Parts)> {
     let mut pooled_cnx = match client.cnx_pool.get().await {
         Ok(cnx) => Ok(cnx),
         Err(err) => Err(anyhow!("failed to get a connection to the server from the pool: {err:?}")),
@@ -202,7 +202,10 @@ pub async fn connect(
         )
     })?;
     debug!("with HTTP upgrade request {req:?}");
-    let transport = pooled_cnx.deref_mut().take().unwrap();
+    let transport = pooled_cnx
+        .take()
+        .and_then(Either::left)
+        .ok_or_else(|| anyhow!("the connection pool did not return a TCP stream"))?;
     let (mut request_sender, cnx) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .timer(TokioTimer::new())
         .adaptive_window(true)
@@ -233,8 +236,8 @@ pub async fn connect(
 
     let (parts, body) = response.into_parts();
     Ok((
-        Http2TunnelRead::new(BodyStream::new(body), Some(cnx_poller)),
-        Http2TunnelWrite::new(tx),
+        Http2TransportRead::new(BodyStream::new(body), Some(cnx_poller)),
+        Http2TransportWrite::new(tx),
         parts,
     ))
 }
