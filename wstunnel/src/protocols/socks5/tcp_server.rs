@@ -1,4 +1,6 @@
 use super::udp_server::{Socks5UdpStream, Socks5UdpStreamWriter};
+use crate::protocols::tcp::configure_socket;
+use crate::somark::SoMark;
 use crate::tunnel::LocalProtocol;
 use crate::tunnel::downstream_listeners::DownstreamWrite;
 use anyhow::Context;
@@ -7,6 +9,7 @@ use fast_socks5::server::states::CommandRead;
 use fast_socks5::util::target_addr::TargetAddr;
 use fast_socks5::{ReplyError, Socks5Command};
 use futures_util::{Stream, StreamExt, stream};
+use socket2::SockRef;
 use std::future::Future;
 use std::io::{Error, ErrorKind, IoSlice};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -114,6 +117,7 @@ impl DownstreamWrite for Socks5WriteHalf {
         match result {
             Ok(()) => {
                 let stream = proto.reply_success(*reply_addr).await.map_err(Error::other)?;
+                let _ = configure_socket(SockRef::from(&stream), SoMark::new(None));
                 let (read_half, write_half) = stream.into_split();
                 // Hand the read half to the paired `Socks5ReadHalf::TcpPending`. If the receiver is
                 // gone (read half dropped) there is nothing to read anyway, so ignore the error.
