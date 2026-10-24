@@ -1,13 +1,13 @@
 [package]
 name = "wstunnel-cli"
-version = "10.7.1"
+version = "11.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-clap = { version = "4.6.6", features = ["derive", "env"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 fdlimit = "0.3.0"
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { version = "1.54.0", features = ["full"] }
 tracing = { version = "0.1.44", features = ["log"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "local-time"] }
 wstunnel = { path = "../wstunnel", default-features = false, features = ["clap"] }
